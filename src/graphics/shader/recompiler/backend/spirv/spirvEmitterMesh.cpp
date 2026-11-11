@@ -46,7 +46,7 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
+		if (variable == 0 && !state.profile.mesh_compute) {
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
@@ -81,6 +81,9 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
+	if (state.profile.mesh_compute) {
+		return; // No mesh outputs: EmitMeshComputeEntryPoint stores to device memory instead.
+	}
 	state.mesh_primitives =
 	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
 	state.mesh_cull =
@@ -135,7 +138,135 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+namespace {
+
+// Stores one dword to device memory.
+void MeshStoreDword(EmitterState& state, uint32_t address, uint32_t value) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+	state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, 4u);
+}
+
+// The mesh program as a compute shader (see IR::MeshFallbackLayout).
+void EmitMeshComputeEntryPoint(EmitterState& state) {
+	const auto& mesh   = state.input_info.vertex->mesh;
+	const auto  layout = IR::MeshFallbackLayout::Make(IR::MeshFallbackParamMask(state.outputs),
+	                                                   mesh.max_vertices, mesh.max_primitives);
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
+	                          spv::FunctionControlMaskNone, TypeFunction(state));
+	EmitLabel(state, state.builder.AllocateId());
+	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
+	                          state.mesh_guest_func);
+	// All guest waves finish before the output stores.
+	EmitBarrier(state);
+	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                                 TypeU32(state), ConstantU32(state, 0));
+	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                                 TypeU32(state), ConstantU32(state, 1));
+	const auto base = PackU64(
+	    state, EmitPushDataLoad(state, ConstantU32(state, IR::PushData::MeshFallbackAddressDword)),
+	    EmitPushDataLoad(state, ConstantU32(state, IR::PushData::MeshFallbackAddressDword + 1u)));
+	const auto groups = EmitPushDataLoad(state, ConstantU32(state, IR::PushData::MeshFallbackGroupsDword));
+	const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+	const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+	const auto slot    = EmitAddU32(state, EmitBinaryU32(state, spv::OpIMul, group_y, groups), group_x);
+	const auto slot_v4 =
+	    EmitBinaryU32(state, spv::OpIMul, slot, ConstantU32(state, layout.slot_stride));
+	// The address of dword `component` of vec4 number `v4`.
+	const auto address = [&](uint32_t v4, uint32_t component) {
+		const auto dword = EmitAddU32(
+		    state, EmitBinaryU32(state, spv::OpIMul, v4, ConstantU32(state, 4)),
+		    ConstantU32(state, component));
+		return Binary(state, spv::OpIAdd, TypeU64(state), base,
+		              Binary(state, spv::OpIMul, TypeU64(state),
+		                     Unary(state, spv::OpUConvert, TypeU64(state), dword),
+		                     ConstantU64(state, 4)));
+	};
+	const auto store_vec4 = [&](uint32_t v4, uint32_t value) {
+		const auto bits = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+		for (uint32_t component = 0; component < 4; component++) {
+			const auto word = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, bits, component);
+			MeshStoreDword(state, address(v4, component), word);
+		}
+	};
+	const auto first = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, EmitLocalInvocationIndex(state),
+	                          ConstantU32(state, 0));
+	EmitIfCondition(state, first, [&] {
+		MeshStoreDword(state, address(slot_v4, 0), vertices);
+		MeshStoreDword(state, address(slot_v4, 1), primitives);
+	});
+	for (uint32_t half = 0; half < state.lane_count; half++) {
+		state.lane_half      = half;
+		const auto index     = EmitLocalInvocationIndex(state);
+		const auto is_vertex = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
+		EmitIfCondition(state, is_vertex, [&] {
+			const auto vertex_v4 = EmitAddU32(
+			    state, EmitAddU32(state, slot_v4, ConstantU32(state, 1)),
+			    EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, layout.vertex_stride)));
+			for (const auto& output: state.outputs) {
+				uint32_t offset;
+				if (output.kind == IR::StageOutputKind::Position && output.index == 0) {
+					offset = 0;
+				} else if (output.kind == IR::StageOutputKind::Parameter && output.location < 32u) {
+					offset = 1u + output.location;
+				} else {
+					continue; // Clip and cull distances and the layer are not exported.
+				}
+				const auto value =
+				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate,
+				             TypeF32Vector(state, 4), ConstantU32(state, half));
+				store_vec4(EmitAddU32(state, vertex_v4, ConstantU32(state, offset)), value);
+			}
+		});
+		const auto is_primitive = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index,
+		                          primitives);
+		EmitIfCondition(state, is_primitive, [&] {
+			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
+			                             TypeU32(state), ConstantU32(state, half));
+			uint32_t   vertex[3] {};
+			for (uint32_t component = 0; component < 3; component++) {
+				vertex[component] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), vertex[component],
+				                          packed, ConstantU32(state, component * 10u),
+				                          ConstantU32(state, 9));
+			}
+			uint32_t flags =
+			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
+			for (const auto& output: state.outputs) {
+				if (output.kind != IR::StageOutputKind::Layer) {
+					continue;
+				}
+				const auto layer = MeshLoad(state, output.mesh_data_variable,
+				                            spv::StorageClassWorkgroup, TypeU32(state),
+				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				flags = EmitBinaryU32(
+				    state, spv::OpBitwiseOr, flags,
+				    EmitBinaryU32(state, spv::OpBitwiseAnd, layer, ConstantU32(state, 0xffffu)));
+			}
+			const auto record = EmitAddU32(
+			    state, EmitAddU32(state, slot_v4, ConstantU32(state, layout.prim_offset)), index);
+			for (uint32_t component = 0; component < 3; component++) {
+				MeshStoreDword(state, address(record, component), vertex[component]);
+			}
+			MeshStoreDword(state, address(record, 3), flags);
+		});
+	}
+	state.lane_half = 0;
+	state.builder.AddFunction(spv::OpReturn);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+} // namespace
+
 void EmitMeshEntryPoint(EmitterState& state) {
+	if (state.profile.mesh_compute) {
+		EmitMeshComputeEntryPoint(state);
+		return;
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());

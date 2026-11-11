@@ -319,6 +319,11 @@ add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
+# Vertex shaders that draw a compute-run mesh program's output on hosts without mesh shaders.
+foreach(kyty_param_count 8 16 24 32)
+	add_gpu_blit_shader(gpu_mesh_fallback_vs${kyty_param_count} gpu_mesh_fallback.vert
+	                    -DPARAM_COUNT=${kyty_param_count})
+endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src

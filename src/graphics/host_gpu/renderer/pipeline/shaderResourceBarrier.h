@@ -8,6 +8,8 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
+// Mesh programs run as compute shaders on hosts without mesh shaders.
+void                    SetMeshComputeFallback(bool enabled);
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
 vk::MemoryBarrier       MakeShaderWriteDependency();

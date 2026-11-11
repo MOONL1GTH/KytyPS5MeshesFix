@@ -364,7 +364,11 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 5;
+	// Dwords 0..4: draw parameters. Dwords 5..7 serve the compute fallback for hosts without mesh
+	// shaders (MeshFallbackLayout): the output buffer address (low, high) and the work group count.
+	static constexpr uint32_t MeshDrawDwordCount = 8;
+	static constexpr uint32_t MeshFallbackAddressDword = 5;
+	static constexpr uint32_t MeshFallbackGroupsDword  = 7;
 	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
 	// task payload (gpu_mesh_indirect.task).
 	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
@@ -391,6 +395,39 @@ struct PushData {
 };
 
 static_assert(sizeof(PushData) == 128);
+
+// Without VK_EXT_mesh_shader a mesh program runs as a compute shader that stores each work group's
+// output into a "slot" of a device buffer, and a vertex shader (gpu_mesh_fallback.vert) draws the
+// triangles from it. A slot is, in vec4 units: a header (x = vertex count, y = primitive count), the
+// vertices (position, then parameters 0..highest location) and one record per primitive (xyz =
+// vertex indices, w = bit 31 culled | layer in the low 16 bits). Slot = group y * groups + group x.
+struct MeshFallbackLayout {
+	uint32_t param_mask    = 0; // parameter locations the program writes
+	uint32_t vertex_stride = 0;
+	uint32_t prim_offset   = 0; // from the slot's start
+	uint32_t slot_stride   = 0;
+
+	[[nodiscard]] static constexpr MeshFallbackLayout Make(uint32_t mask, uint32_t max_vertices,
+	                                                       uint32_t max_primitives) {
+		MeshFallbackLayout layout;
+		layout.param_mask    = mask;
+		layout.vertex_stride = 1u + (mask != 0 ? static_cast<uint32_t>(std::bit_width(mask)) : 0u);
+		layout.prim_offset   = 1u + max_vertices * layout.vertex_stride;
+		layout.slot_stride   = layout.prim_offset + max_primitives;
+		return layout;
+	}
+};
+
+template <typename Outputs>
+[[nodiscard]] constexpr uint32_t MeshFallbackParamMask(const Outputs& outputs) {
+	uint32_t mask = 0;
+	for (const StageOutput& output: outputs) {
+		if (output.kind == StageOutputKind::Parameter && output.location < 32u) {
+			mask |= 1u << output.location;
+		}
+	}
+	return mask;
+}
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -243,7 +244,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .mesh_compute           = !graphics.mesh_shader_enabled};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -470,6 +472,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	SetMeshComputeFallback(!graphics.mesh_shader_enabled);
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }
@@ -711,17 +714,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		if (!m_graphics.mesh_shader_enabled) {
-			// The host GPU has no VK_EXT_mesh_shader (e.g. AMD RDNA 1). Skip these draws
-			// instead of exiting, so the rest of the frame can still render.
-			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(
-				    "Warning: this GPU does not support mesh shaders; dropping all draws that "
-				    "use PS5 primitive (NGG) shaders. Some geometry will not be visible.\n");
-			}
-			return;
-		}
+		// Without VK_EXT_mesh_shader the mesh program runs as a compute shader and a vertex
+		// shader draws its output (IR::MeshFallbackLayout), so the compute limits apply.
+		const bool compute_fallback = !m_graphics.mesh_shader_enabled;
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
@@ -729,11 +724,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
 		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+		const auto& compute_limits = m_graphics.GetPhysicalDeviceProperties().limits;
+		const bool  unsupported =
+		    compute_fallback
+		        ? host_threads > compute_limits.maxComputeWorkGroupInvocations ||
+		              host_threads > compute_limits.maxComputeWorkGroupSize[0] ||
+		              (mesh.lds_size_dwords + 2u + mesh.max_vertices) * sizeof(uint32_t) >
+		                  compute_limits.maxComputeSharedMemorySize
+		        : host_threads > limits.maxMeshWorkGroupInvocations ||
+		              host_threads > limits.maxMeshWorkGroupSize[0] ||
+		              mesh.max_vertices > limits.maxMeshOutputVertices ||
+		              mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+		              mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize;
+		if (unsupported) {
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
@@ -745,7 +748,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		// A task shader launches each record's groups and passes its draw parameters in a
 		// payload beside the LDS, the allocation pair and the Layer array; without room for
 		// it, the CPU reads the records.
-		if (state.indirect_draw &&
+		if (!compute_fallback && state.indirect_draw &&
 		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
 		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
 		        limits.maxMeshPayloadAndSharedMemorySize) {
@@ -1080,6 +1083,24 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	StorePipeline(key);
 	CheckpointDriverCache();
 
+	return pipeline;
+}
+
+PipelineCache::Pipeline& PipelineCache::GetMeshComputePipeline(const ShaderModule& module) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(MeshCompute)", profiler::colors::RedA100);
+
+	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
+	auto& pipeline        = iter->second;
+	if (!inserted) {
+		return pipeline;
+	}
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+	}
+	CheckpointDriverCache();
 	return pipeline;
 }
 

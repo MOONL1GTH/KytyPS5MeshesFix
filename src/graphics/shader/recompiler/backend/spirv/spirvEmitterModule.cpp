@@ -480,6 +480,10 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (state.program.stage == ShaderType::Mesh && state.profile.mesh_compute) {
+		// The compute entry point addresses its output slot by work group.
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
@@ -731,15 +735,17 @@ void DefineModule(EmitterState& state) {
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
-		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
-		state.builder.RequireExtension("SPV_EXT_mesh_shader");
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
-		                               state.input_info.vertex->mesh.max_vertices);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
-		                               state.input_info.vertex->mesh.max_primitives);
-		if (state.input_info.vertex->indirect_draw) {
+		if (!state.profile.mesh_compute) {
+			state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
+			state.builder.RequireExtension("SPV_EXT_mesh_shader");
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
+			                               state.input_info.vertex->mesh.max_vertices);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
+			                               state.input_info.vertex->mesh.max_primitives);
+		}
+		if (state.input_info.vertex->indirect_draw && !state.profile.mesh_compute) {
 			// The task shader's payload (gpu_mesh_indirect.task).
 			const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
 			state.mesh_payload = DefineInterfaceVariable(
@@ -764,7 +770,9 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses = state.program.info.uses_dma ||
 	                                state.program.info.uses_image_heap ||
-	                                state.program.info.uses_device_address;
+	                                state.program.info.uses_device_address ||
+	                                (state.program.stage == ShaderType::Mesh &&
+	                                 state.profile.mesh_compute);
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);

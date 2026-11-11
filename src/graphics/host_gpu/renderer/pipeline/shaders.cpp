@@ -1,6 +1,10 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_mesh_fallback_vs16_spv.h"
+#include "gpu_blit_shaders/gpu_mesh_fallback_vs24_spv.h"
+#include "gpu_blit_shaders/gpu_mesh_fallback_vs32_spv.h"
+#include "gpu_blit_shaders/gpu_mesh_fallback_vs8_spv.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -151,7 +155,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool  with_depth    = rendering.depth_format != vk::Format::eUndefined ||
 	                            rendering.stencil_format != vk::Format::eUndefined;
 	const bool  mesh          = vertex.info.stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	// Without mesh shaders, the mesh program runs as a compute shader (PipelineCache::
+	// GetMeshComputePipeline) and this pipeline draws its output with a vertex shader.
+	const bool mesh_fallback = mesh && !graphics.mesh_shader_enabled;
 	const bool rect_list = static_params.patch_control_points != 0 && stages[1] == nullptr;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
@@ -167,10 +173,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
 
+	vk::ShaderModule mesh_fallback_module = nullptr;
+	if (mesh_fallback) {
+		const auto mask = ShaderRecompiler::IR::MeshFallbackParamMask(vertex.info.info.outputs);
+		const auto count = mask != 0 ? static_cast<uint32_t>(std::bit_width(mask)) : 0u;
+		const std::span<const uint32_t> spirv = count <= 8u    ? std::span<const uint32_t>(GPU_MESH_FALLBACK_VS8_SPV)
+		                                        : count <= 16u ? std::span<const uint32_t>(GPU_MESH_FALLBACK_VS16_SPV)
+		                                        : count <= 24u ? std::span<const uint32_t>(GPU_MESH_FALLBACK_VS24_SPV)
+		                                                       : std::span<const uint32_t>(GPU_MESH_FALLBACK_VS32_SPV);
+		mesh_fallback_module = CompileSPV(spirv, graphics.device);
+	}
+
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
 	for (const auto* stage: stages) {
-		if (stage != nullptr) {
+		if (stage != nullptr && mesh_fallback && stage == &vertex) {
+			shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eVertex,
+			                                       .module = mesh_fallback_module,
+			                                       .pName  = "main"};
+		} else if (stage != nullptr) {
 			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
 			                                       .module = stage->module,
 			                                       .pName  = "main"};
@@ -219,6 +240,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	input_assembly.topology = static_params.topology;
 	input_assembly.primitiveRestartEnable =
 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
+	if (mesh_fallback) {
+		input_assembly.topology               = vk::PrimitiveTopology::eTriangleList;
+		input_assembly.primitiveRestartEnable = VK_FALSE;
+	}
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
@@ -288,8 +313,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (task_module) {
 		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	}
+	if (mesh_fallback) {
+		// The vertex shader reads its draw data from push constants only.
+		pipeline.push_stages |= vk::ShaderStageFlagBits::eVertex;
+	}
 	for (const auto* stage: stages) {
-		if (stage != nullptr) {
+		if (stage != nullptr && !(mesh_fallback && stage == &vertex)) {
 			const auto native_stage = NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
@@ -339,8 +368,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
-	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
+	pipeline_info.pVertexInputState        = mesh && !mesh_fallback ? nullptr : &vertex_input_info;
+	pipeline_info.pInputAssemblyState      = mesh && !mesh_fallback ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints = static_params.patch_control_points;
 	pipeline_info.pTessellationState =
@@ -360,6 +389,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	graphics.device.destroyShaderModule(mesh_fallback_module, nullptr);
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

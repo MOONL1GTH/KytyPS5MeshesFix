@@ -5,15 +5,27 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <cstring>
 
 namespace Libs::Graphics {
+
+namespace {
+std::atomic_bool g_mesh_compute_fallback = false;
+} // namespace
+
+void SetMeshComputeFallback(bool enabled) {
+	g_mesh_compute_fallback.store(enabled, std::memory_order_relaxed);
+}
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Local:
 		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
-		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
+		case ShaderType::Mesh:
+			return g_mesh_compute_fallback.load(std::memory_order_relaxed)
+			           ? vk::ShaderStageFlagBits::eCompute
+			           : vk::ShaderStageFlagBits::eMeshEXT;
 		case ShaderType::TessellationControl: return vk::ShaderStageFlagBits::eTessellationControl;
 		case ShaderType::TessellationEvaluation:
 			return vk::ShaderStageFlagBits::eTessellationEvaluation;

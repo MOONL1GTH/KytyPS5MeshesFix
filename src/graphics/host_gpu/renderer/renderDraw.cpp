@@ -598,6 +598,9 @@ struct DrawIndexBufferSource {
 	uint32_t    guest_element_size = 0;
 };
 
+// Output buffer of mesh programs that run as compute shaders (IR::MeshFallbackLayout).
+constexpr uint64_t MeshFallbackBufferSize = 192ull * 1024 * 1024;
+
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
@@ -1056,6 +1059,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
+	// Without mesh shaders the mesh program runs as a compute shader and a vertex shader draws
+	// what it wrote.
+	const bool mesh_fallback = mesh_active && !m_context.GetGraphics().mesh_shader_enabled;
+	ShaderRecompiler::IR::MeshFallbackLayout fallback_layout;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1078,7 +1085,34 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			return;
 		}
 		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+		const auto& compute_limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+		if (mesh_fallback) {
+			fallback_layout = ShaderRecompiler::IR::MeshFallbackLayout::Make(
+			    ShaderRecompiler::IR::MeshFallbackParamMask(
+			        state.vertex_info[0].stage.module->info.info.outputs),
+			    mesh.max_vertices, mesh.max_primitives);
+			const uint64_t bytes = static_cast<uint64_t>(mesh_groups) * draw.instance_count *
+			                       fallback_layout.slot_stride * 16u;
+			const uint64_t vertices =
+			    static_cast<uint64_t>(mesh_groups) * mesh.max_primitives * 3u;
+			if (mesh_groups > compute_limits.maxComputeWorkGroupCount[0] ||
+			    draw.instance_count > compute_limits.maxComputeWorkGroupCount[1] ||
+			    bytes > MeshFallbackBufferSize || vertices > UINT32_MAX) {
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					std::printf("Warning: dropping a mesh draw too large for the compute fallback "
+					            "(%u groups x %u instances, %llu bytes)\n",
+					            mesh_groups, draw.instance_count,
+					            static_cast<unsigned long long>(bytes));
+				}
+				return;
+			}
+			if (m_mesh_fallback_buffer == nullptr) {
+				m_mesh_fallback_buffer = std::make_unique<Buffer>(
+				    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal,
+				    0, AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, MeshFallbackBufferSize);
+			}
+		} else if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
 		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
 		        limits.maxMeshWorkGroupTotalCount) {
@@ -1130,6 +1164,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	PipelineCache::Pipeline* mesh_compute_pipeline = nullptr;
+	if (mesh_fallback) {
+		mesh_compute_pipeline = &m_context.GetPipelineCache().GetMeshComputePipeline(
+		    *state.vertex_info[0].stage.module);
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1158,11 +1197,52 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	using ShaderRecompiler::IR::PushData;
+	auto graphics_stages = stages;
+	vk::DeviceAddress fallback_address = 0;
+	if (mesh_fallback) {
+		// Run the mesh program as a compute shader that writes each group's vertices and
+		// triangles to the fallback buffer; the draw below reads them back. A mesh draw has a
+		// single vertex stage, which is stage 0.
+		fallback_address = m_mesh_fallback_buffer->BufferDeviceAddress();
+		buffer.EndRendering();
+		// The previous fallback draw's vertex shader may still be reading the buffer.
+		const vk::MemoryBarrier before {
+		    .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+		    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader |
+		                              vk::PipelineStageFlagBits::eComputeShader,
+		                          vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags {},
+		                          1, &before, 0, nullptr, 0, nullptr);
+		PreparedBindings* compute_stage = &bindings.vertex[0];
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *mesh_compute_pipeline,
+		               std::span<PreparedBindings* const> {&compute_stage, 1});
+		std::array<uint32_t, PushData::MeshDrawDwordCount> compute_data {
+		    draw.index_count,
+		    static_cast<uint32_t>(emit.vertex_offset),
+		    index_source.guest_element_size,
+		    static_cast<uint32_t>(mesh_indices),
+		    static_cast<uint32_t>(mesh_indices >> 32u),
+		    static_cast<uint32_t>(fallback_address),
+		    static_cast<uint32_t>(fallback_address >> 32u),
+		    mesh_groups};
+		vk_buffer.pushConstants(mesh_compute_pipeline->pipeline_layout,
+		                        mesh_compute_pipeline->push_stages, 0,
+		                        compute_data.size() * sizeof(uint32_t), compute_data.data());
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, mesh_compute_pipeline->pipeline);
+		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
+		const vk::MemoryBarrier after {
+		    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+		    .dstAccessMask = vk::AccessFlagBits::eShaderRead};
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		                          vk::PipelineStageFlagBits::eVertexShader, vk::DependencyFlags {}, 1,
+		                          &after, 0, nullptr, 0, nullptr);
+		graphics_stages = stages.subspan(1);
+	}
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, graphics_stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
-	using ShaderRecompiler::IR::PushData;
 	const auto draw_dwords =
 	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
@@ -1170,6 +1250,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		if (mesh_task) {
 			draw_data[0] = static_cast<uint32_t>(task_params);
 			draw_data[1] = static_cast<uint32_t>(task_params >> 32u);
+		} else if (mesh_fallback) {
+			// The vertex shader's parameters (gpu_mesh_fallback.vert).
+			draw_data = {mesh.max_primitives,
+			             fallback_layout.slot_stride,
+			             fallback_layout.prim_offset,
+			             fallback_layout.vertex_stride,
+			             fallback_layout.param_mask,
+			             static_cast<uint32_t>(fallback_address),
+			             static_cast<uint32_t>(fallback_address >> 32u),
+			             mesh_groups};
 		} else if (mesh_active) {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
@@ -1213,7 +1303,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
+	if (mesh_fallback) {
+		vk_buffer.draw(mesh_groups * mesh.max_primitives * 3u, draw.instance_count, 0, 0);
+	} else if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);

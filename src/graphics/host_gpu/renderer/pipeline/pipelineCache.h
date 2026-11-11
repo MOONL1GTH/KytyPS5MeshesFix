@@ -208,6 +208,8 @@ public:
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// A mesh program that runs as a compute shader on hosts without mesh shaders.
+	Pipeline& GetMeshComputePipeline(const ShaderModule& module);
 
 private:
 	friend struct PipelineCacheTestAccess;

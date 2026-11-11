@@ -22,6 +22,8 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// No mesh shaders on the host: mesh programs compile to compute shaders (MeshFallbackLayout).
+	bool mesh_compute = false;
 };
 
 inline constexpr Profile DefaultProfile {};
