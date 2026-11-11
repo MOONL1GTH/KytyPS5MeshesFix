@@ -1107,6 +1107,21 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				}
 				return;
 			}
+			{
+				static std::atomic_uint64_t fb_draws = 0;
+				static std::atomic_uint64_t fb_vertices = 0;
+				const auto n = fb_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+				fb_vertices.fetch_add(vertices * draw.instance_count, std::memory_order_relaxed);
+				if (n <= 5 || n % 2000 == 0) {
+					std::printf("MeshFallback draw #%llu: groups=%u instances=%u max_prims=%u max_verts=%u "
+					            "prims_per_group=%u slot_dwords=%u virtual_vertices=%llu (total %llu)\n",
+					            static_cast<unsigned long long>(n), mesh_groups, draw.instance_count,
+					            mesh.max_primitives, mesh.max_vertices, mesh.primitives_per_group,
+					            fallback_layout.slot_stride * 4u,
+					            static_cast<unsigned long long>(vertices * draw.instance_count),
+					            static_cast<unsigned long long>(fb_vertices.load(std::memory_order_relaxed)));
+				}
+			}
 			if (m_mesh_fallback_buffer == nullptr) {
 				m_mesh_fallback_buffer = std::make_unique<Buffer>(
 				    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal,
