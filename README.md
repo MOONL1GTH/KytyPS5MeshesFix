@@ -1,67 +1,58 @@
 # KytyPS5 MeshesFix
 
-An **experimental fork** of [KytyPS5](https://github.com/KytyPS5/KytyPS5), a free and open-source
-PlayStation 5 translation layer, that tries to run games on GPUs **without `VK_EXT_mesh_shader`**
-support, such as AMD RDNA 1 cards (for example the RX 5600M and RX 5700 series).
+An experimental fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) that adds support for
+GPUs without Vulkan mesh shaders (`VK_EXT_mesh_shader`), such as AMD RDNA 1 (RX 5600M,
+RX 5700 series).
 
-> [!IMPORTANT]
-> This fork is not affiliated with Sony Interactive Entertainment, PlayStation or the KytyPS5
-> maintainers. It does not distribute games or copyrighted system software. Use only game files
-> that you have obtained legally.
+> **Status: experimental.** Behavior is under active development and not yet validated across
+> games. Expect crashes, graphical errors and reduced performance.
 
-> [!WARNING]
-> Work in progress. The changes here are largely untested, and games may crash, render
-> incorrectly or run slowly. Do not expect upstream-level compatibility.
+## Background
 
-## The problem
-
-KytyPS5 translates the PS5's primitive (NGG) shaders into Vulkan mesh shaders. GPUs without
-mesh shader support stop with:
+KytyPS5 translates PS5 primitive (NGG) shaders into Vulkan mesh shaders. On GPUs that lack
+this extension, the emulator aborts with:
 
 ```
-Not implemented (!m_graphics.mesh_shader_enabled) in ...pipelineCache.cpp
+Not implemented (!m_graphics.mesh_shader_enabled)
 ```
 
-so most 3D games cannot run on them.
+which prevents most 3D titles from running.
 
-## What this fork changes
+## Approach
 
-1. **Stage 1: no crash.** Draws that need mesh shaders are skipped with a warning instead of
-   exiting the emulator.
-2. **Stage 2: compute fallback.** When the GPU has no mesh shaders, each PS5 primitive shader is
-   compiled as a **compute shader** that writes its vertices and triangles to a GPU buffer. A
-   generic vertex shader (`src/graphics/host_gpu/shaders/gpu_mesh_fallback.vert`) then draws
-   from that buffer, and the normal pixel shaders are used unchanged.
+When mesh shaders are unavailable, this fork replaces the mesh stage with an equivalent
+two-pass pipeline:
 
-Design notes and the list of changed files are in [`HANDOFF.md`](HANDOFF.md).
+1. **Compute pass.** The translated primitive shader runs as a compute shader and writes
+   vertex attributes and primitive indices into a device-local buffer.
+2. **Vertex pass.** A generic vertex shader reads that buffer and feeds the unmodified
+   fragment pipeline.
 
-### Known limitations
+GPUs with native mesh shader support continue to use the original path.
 
-- Clip and cull distances and user clip planes are not applied to fallback draws.
-- Indirect mesh draws use the CPU path, and primitive restart is ignored.
-- Each fallback draw interrupts the render pass, so performance is reduced.
-- Draws needing more than 192 MB of fallback buffer are skipped with a warning.
+## Releases
 
-## Building
+Prebuilt Windows x64 builds are published on the
+[Releases](../../releases) page. Download the latest archive, extract it, and delete any
+existing `_PipelineCache` folder before first launch.
 
-You do not need a local toolchain. The build runs on GitHub Actions:
+## Known limitations
 
-1. Open the **Actions** tab and select **Build and Release KytyPS5**.
-2. Run the workflow (or push a commit) and wait for the **Windows** job to finish.
-3. Download the `KytyPS5-Windows-x64` artifact and unzip it.
-4. **Delete the `_PipelineCache` folder** next to the executable when switching between builds.
+- Clip distances, cull distances and user clip planes are not applied on fallback draws.
+- Indirect mesh draws use the CPU path; primitive restart is ignored.
+- Each fallback draw splits the render pass, which reduces performance.
+- Draws requiring more than 192 MB of intermediate buffer are skipped with a warning.
 
-To build locally, follow the instructions in the
-[upstream repository](https://github.com/KytyPS5/KytyPS5).
+## Reporting issues
 
-## Reporting results
-
-Useful reports include your GPU model, the game's title ID, and the console output. Build
-errors from the Actions log are also helpful. Please do not report problems from this fork to
-the upstream maintainers unless you can reproduce them with an unmodified upstream build.
+Please include your GPU model, driver version, game title ID and the console log. Report
+problems specific to this fork here, not to the upstream project.
 
 ## Credits and license
 
-KytyPS5 is based on a heavily modified version of [Kyty](https://github.com/InoriRus/Kyty).
-All credit for the emulator goes to the KytyPS5 and Kyty authors. This fork keeps the upstream
-license, **GPL-2.0**; see [`LICENSE`](LICENSE) and the [`LICENSES`](LICENSES) folder.
+Based on [KytyPS5](https://github.com/KytyPS5/KytyPS5), itself derived from
+[Kyty](https://github.com/InoriRus/Kyty). Distributed under the **GPL-2.0** license; see
+[LICENSE](LICENSE).
+
+This project is not affiliated with Sony Interactive Entertainment. It does not include or
+distribute games or system software; use only content you have legally obtained.
