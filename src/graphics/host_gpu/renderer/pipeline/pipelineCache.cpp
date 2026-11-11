@@ -711,7 +711,17 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		if (!m_graphics.mesh_shader_enabled) {
+			// The host GPU has no VK_EXT_mesh_shader (e.g. AMD RDNA 1). Skip these draws
+			// instead of exiting, so the rest of the frame can still render.
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: this GPU does not support mesh shaders; dropping all draws that "
+				    "use PS5 primitive (NGG) shaders. Some geometry will not be visible.\n");
+			}
+			return;
+		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
