@@ -37,6 +37,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1086,6 +1087,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& compute_limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+		if (mesh_fallback) {
+			// Debug: KYTY_SKIP_MESH=1 drops every mesh draw, to compare speed and colors without them.
+			static const bool skip_mesh = std::getenv("KYTY_SKIP_MESH") != nullptr;
+			if (skip_mesh) {
+				return;
+			}
+		}
 		if (mesh_fallback) {
 			fallback_layout = ShaderRecompiler::IR::MeshFallbackLayout::Make(
 			    ShaderRecompiler::IR::MeshFallbackParamMask(
